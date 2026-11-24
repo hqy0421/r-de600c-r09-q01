@@ -102,6 +102,79 @@ class Node(Base):
     )
 
 
+class NodeHistory(Base):
+    """Append-only, system-period history of node structure (bitemporal hierarchy).
+
+    Every structural state of a node occupies one row, stamped with the
+    half-open knowledge interval ``[valid_from, valid_to)`` during which that
+    state was the known truth:
+
+    * ``valid_to IS NULL`` marks the single **current** row for the node.
+    * A move / rename closes the prior row (``valid_to = now()``) and opens a
+      new one carrying the new ``parent_uuid`` / ``path`` (and, for a rename,
+      ``name``). A subtree move/rename therefore writes one history row per
+      re-pathed node, all sharing the same ``valid_from``.
+    * A delete closes the row and opens no replacement.
+
+    The node's stable ``uuid`` is the join key across every interval, so a
+    point moved A→B keeps one identity while its as-of path changes. Time-series
+    values in ClickHouse are keyed by ``series_id`` (owner uuid), never path, so
+    they remain continuously addressable through the move. This table is the
+    structural counterpart of TimeDB's knowledge-time forecast versions: an
+    as-of read at knowledge time *t* resolves both the path known at *t* (here)
+    and the forecast version known at *t* (TimeDB).
+
+    Pure structural columns only — ``node_type`` / ``data`` edits do not change
+    asset path or parent identity, so they deliberately do not open an interval.
+    Application-maintained (no DB trigger) to keep the schema Alembic-friendly,
+    mirroring how series immutability is enforced.
+    """
+
+    __tablename__ = "node_history"
+
+    node_uuid = sa.Column(UUID(as_uuid=True), primary_key=True)
+    valid_from = sa.Column(sa.DateTime(timezone=True), primary_key=True)
+    namespace = sa.Column(sa.Text, nullable=False, server_default=NAMESPACE_DEFAULT)
+    node_type = sa.Column(sa.Text, nullable=False)
+    name = sa.Column(sa.Text, nullable=False)
+    parent_uuid = sa.Column(UUID(as_uuid=True), nullable=True)
+    path = sa.Column(sa.Text, nullable=False)
+    valid_to = sa.Column(sa.DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        # RESTRICT-less but non-cascading: a deleted node's history is retained
+        # as an audit trail (the live DELETE closes the open interval first; see
+        # NodeScope.delete). node_uuid is part of this table's PK and so cannot
+        # use ON DELETE SET NULL. Application code owns removing history when a
+        # purge is genuinely wanted.
+        sa.ForeignKeyConstraint(
+            ["node_uuid"],
+            [_fk("node.uuid")],
+            name="node_history_node_fkey",
+        ),
+        # Current-state lookup by node, and the "exactly one open interval"
+        # invariant (a partial unique index on the open row).
+        sa.Index(
+            "ix_node_history_current",
+            "node_uuid",
+            unique=True,
+            postgresql_where=sa.text("valid_to IS NULL"),
+        ),
+        # As-of point lookup: all intervals covering a knowledge time for a node.
+        sa.Index("ix_node_history_uuid_interval", "node_uuid", "valid_from", "valid_to"),
+        # As-of path lookup (history resolve by the path that was valid then).
+        sa.Index(
+            "ix_node_history_path_interval",
+            "namespace",
+            "path",
+            "valid_from",
+            "valid_to",
+        ),
+        sa.CheckConstraint("length(path) > 0", name="node_history_path_nonempty"),
+        {"schema": SCHEMA},
+    )
+
+
 class Edge(Base):
     __tablename__ = "edge"
 

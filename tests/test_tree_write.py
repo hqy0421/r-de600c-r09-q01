@@ -55,7 +55,9 @@ def _make_conn(*, fetchall=None, execute_side_effect=None) -> MagicMock:
     else:
         cursor = MagicMock()
         cursor.fetchall = AsyncMock(return_value=fetchall if fetchall is not None else [])
-        cursor.fetchone = AsyncMock(return_value=None)
+        # history.transaction_now() reads the shared mutation boundary via
+        # SELECT clock_timestamp(); the default mock returns a fixed instant.
+        cursor.fetchone = AsyncMock(return_value=(datetime(2026, 1, 1, tzinfo=UTC),))
         conn.execute = AsyncMock(return_value=cursor)
     batch_cursor = MagicMock()
     batch_cursor.executemany = AsyncMock()
@@ -262,7 +264,11 @@ class TestRegisterTree:
         # Use side_effect to dispatch based on the SQL substring.
         def execute_side_effect(sql, *args, **kwargs):
             res = MagicMock()
-            if "WHERE path = %s" in sql:
+            if "clock_timestamp" in sql:
+                # history.transaction_now() shared mutation boundary.
+                res.fetchone = AsyncMock(return_value=(datetime(2026, 1, 1, tzinfo=UTC),))
+                res.fetchall = AsyncMock(return_value=[])
+            elif "WHERE path = %s" in sql:
                 # resolve_node_uuid materialized-path lookup uses fetchone.
                 res.fetchone = AsyncMock(return_value=(parent_uuid,))
                 res.fetchall = AsyncMock(return_value=[])

@@ -32,6 +32,7 @@ from psycopg.types.json import Jsonb
 from timedatamodel import TimeSeries, TimeSeriesType
 from uuid6 import uuid7
 
+from energydb import history as history_mod
 from energydb import series as series_mod
 from energydb.diff import EdgeChange, EdgeSnapshot, NodeChange, NodeSnapshot, TreeDiff
 from energydb.errors import AlreadyExistsError, NodeNotFoundError, ValidationError
@@ -104,9 +105,21 @@ async def create_node_raw(
             raise NodeNotFoundError(f"parent_uuid={parent_uuid} does not exist", uuid=parent_uuid)
         path = f"{parent_row[0]}/{name}"
 
+    # One boundary for the node row and its initial history interval.
+    now = await history_mod.transaction_now(conn)
     await conn.execute(
-        f"INSERT INTO {P}node (uuid, node_type, name, parent_uuid, path, data) VALUES (%s, %s, %s, %s, %s, %s)",
-        (uuid_val, node_type, name, parent_uuid, path, Jsonb(data or {})),
+        f"INSERT INTO {P}node (uuid, node_type, name, parent_uuid, path, data, created_at, updated_at) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+        (uuid_val, node_type, name, parent_uuid, path, Jsonb(data or {}), now, now),
+    )
+    await history_mod.open_node_interval(
+        conn,
+        node_uuid=uuid_val,
+        node_type=node_type,
+        name=name,
+        parent_uuid=parent_uuid,
+        path=path,
+        valid_from=now,
     )
     return uuid_val
 
@@ -296,6 +309,14 @@ async def register_tree_under(
 
     series_rows = _collect_series_rows(node_objs, edge_objs)
 
+    # One knowledge-time boundary for the whole tree so every node's initial
+    # history interval shares the same valid_from.
+    now = await history_mod.transaction_now(conn)
+    history_rows = [
+        (uid, now, snap.node_type, snap.name, snap.parent_uuid, paths[uid], None)
+        for uid, snap in target_nodes.items()
+    ]
+
     # The conflict mapping wraps the pipeline, not the edge statement: a
     # pipelined error surfaces at sync-on-exit, not at the execute that caused
     # it. Non-edge_uniq violations propagate untouched.
@@ -303,6 +324,12 @@ async def register_tree_under(
         await cur.executemany(
             f"INSERT INTO {P}node (uuid, node_type, name, parent_uuid, path, data) VALUES (%s, %s, %s, %s, %s, %s)",
             node_rows,
+        )
+        await cur.executemany(
+            f"INSERT INTO {P}node_history "
+            "(node_uuid, valid_from, node_type, name, parent_uuid, path, valid_to) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            history_rows,
         )
         if edge_rows:
             await cur.executemany(

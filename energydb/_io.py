@@ -597,6 +597,7 @@ async def execute_read(
     bucket_us: int | None = None,
     bucket_dedup: bool = True,
     on_missing: OnMissing = "raise",
+    as_of: datetime | None = None,
     td_kwargs: dict | None = None,
 ) -> tuple[pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame], int, pl.DataFrame]:
     """The one read pipeline: resolve meta, read values from CH, finish.
@@ -657,8 +658,12 @@ async def execute_read(
         else {
             "start_valid": start_valid,
             "end_valid": end_valid,
+            # An as_of read bounds BOTH temporal axes to the same knowledge
+            # time: the hierarchy resolve (node_history, below) and the
+            # forecast-version selection here. end_known is the exclusive upper
+            # bound so the latest version known at/before as_of wins.
             "start_known": start_known,
-            "end_known": end_known,
+            "end_known": as_of if as_of is not None else end_known,
             "include_updates": include_updates,
             "bucket_us": bucket_us,
             "bucket_dedup": bucket_dedup,
@@ -675,7 +680,16 @@ async def execute_read(
         assert manifest is not None
         with profiling._phase(profiling.PHASE_EDB_RESOLVE):
             async with client._read_conn() as conn:
-                resolved, summary = await resolve_manifest(conn, manifest, on_missing=on_missing)
+                if as_of is not None:
+                    # Bitemporal resolve: interpret paths against the hierarchy
+                    # as it was known at as_of, not today's tree.
+                    from energydb.history import resolve_manifest_as_of
+
+                    resolved, summary = await resolve_manifest_as_of(
+                        conn, manifest, as_of=as_of, on_missing=on_missing
+                    )
+                else:
+                    resolved, summary = await resolve_manifest(conn, manifest, on_missing=on_missing)
         missing = summary.missing
         with profiling._phase(profiling.PHASE_EDB_MANIFEST_BUILD):
             return _project_meta(resolved, is_edge=is_edge)
@@ -693,7 +707,16 @@ async def execute_read(
         identity = pl.DataFrame(schema={c: pl.Utf8 for c in identity_cols})
         return data.hstack(identity), 0, missing
 
-    meta_source = engine_meta() if (engine_meta is not None and not client._engine_unavailable) else None
+    # The CH PostgreSQL-engine table mirrors only the *current* hierarchy and
+    # carries no knowledge-time predicate, so an as-of read must take the
+    # sequential path: its series set comes from node_history and its value
+    # window is bounded by end_known. Forcing the engine here would mis-resolve
+    # moved paths and ignore the version bound.
+    meta_source = (
+        engine_meta()
+        if (engine_meta is not None and not client._engine_unavailable and as_of is None)
+        else None
+    )
     if meta_source is not None:
         call = _td_call(td, relative=relative, kwargs=kwargs, meta_source=meta_source)
 

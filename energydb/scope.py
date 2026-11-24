@@ -31,6 +31,7 @@ from timedatamodel import TimeSeries, TimeSeriesType
 from timedb import PgEngineMeta, UnchangedScope, profiling
 from timedb import read as timedb_read
 
+from energydb import history as history_mod
 from energydb import series as series_mod
 from energydb._ch_meta_engine import CH_ENGINE_TABLE
 from energydb._frames import Backend, Output, to_backend, to_polars
@@ -363,13 +364,19 @@ class _BaseScope:
         """The typed not-found error for this scope's target, addressed by uuid."""
         raise NotImplementedError
 
-    async def _build_resolved_meta(self, *, data_type: str | None, name: str | None) -> pl.DataFrame | None:
+    async def _build_resolved_meta(
+        self, *, data_type: str | None, name: str | None, as_of: datetime | None = None
+    ) -> pl.DataFrame | None:
         """Subclass-specific: resolve the scope to per-series meta in PG.
 
         Returns one row per series with columns ``(series_id, retention,
         canonical_unit, data_type, name)`` plus exactly one of
         ``node_uuid`` / ``edge_uuid``, which is the input shape
         :func:`execute_read` expects. Returns ``None`` when the scope is empty / nothing matches.
+
+        ``as_of`` (node scopes only) resolves the subtree against the hierarchy
+        known at that knowledge time via the node history, instead of the live
+        tree; edge scopes reject it before reaching here.
         """
         raise NotImplementedError
 
@@ -547,6 +554,7 @@ class _BaseScope:
         include_knowledge_time: bool = False,
         output: Output = "frame",
         backend: Backend = "polars",
+        as_of: datetime | None = None,
     ) -> (
         pl.DataFrame
         | pd.DataFrame
@@ -564,16 +572,32 @@ class _BaseScope:
         parallel with the CH value read; otherwise (``.where()`` filters,
         uuid-addressed subtrees, or an unavailable engine) it runs sequentially.
         Results are identical either way.
+
+        Pass a timezone-aware ``as_of`` for a bitemporal point-in-time read on a
+        :class:`NodeScope`: the subtree is resolved against the asset hierarchy
+        known at that instant (a node later moved out of the subtree is still
+        included then) and the value window's knowledge-time upper bound is set
+        to it, selecting the forecast version known then. Not supported on
+        :class:`EdgeScope` (edge endpoint history is not tracked).
         """
         if self._txn is not None:
             _ts_io_unsupported_in_txn("read")
+        if as_of is not None:
+            if as_of.tzinfo is None:
+                raise ValidationError("as_of must be a timezone-aware datetime")
+            if end_known is not None:
+                raise ValidationError("as_of sets the knowledge-time upper bound; do not also pass end_known.")
+            if self._owner_col == "edge_uuid":
+                raise ValidationError(
+                    "as_of reads are supported for node scopes only; edge endpoint history is not tracked."
+                )
         # Subtree reads return empty rather than raising, so there is no
         # on_missing to expose and the third element is always empty.
         result, n_series, _missing = await execute_read(
             self._pool,
             self._td,
             self._client,
-            resolve=lambda: self._build_resolved_meta(data_type=data_type, name=name),
+            resolve=lambda: self._build_resolved_meta(data_type=data_type, name=name, as_of=as_of),
             is_edge=(self._owner_col == "edge_uuid"),
             engine_meta=lambda: self._engine_meta(data_type=data_type, name=name),
             unit=unit,
@@ -584,6 +608,7 @@ class _BaseScope:
             include_updates=include_updates,
             include_knowledge_time=include_knowledge_time,
             output=output,
+            as_of=as_of,
         )
         return self._finalize_result(result, n_series=n_series, output=output, backend=backend)
 
@@ -592,6 +617,7 @@ class _BaseScope:
         *,
         data_type: str | None = None,
         name: str | None = None,
+        as_of: datetime | None = None,
     ) -> pl.DataFrame | None:
         """Resolve this scope to per-series read metadata in one PG round-trip,
         *without* reading any timeseries data.
@@ -603,10 +629,21 @@ class _BaseScope:
         caller authorize or inspect (e.g. by ``path``) before paying for the
         ClickHouse read; ``resolve()`` then :meth:`read_from_meta` is exactly
         what :meth:`read` does in one call (sequential path).
+
+        Pass a timezone-aware ``as_of`` (node scopes only) to resolve against
+        the hierarchy known at that knowledge time; the returned ``path``
+        labels reflect where each node lived then.
         """
         if self._txn is not None:
             _ts_io_unsupported_in_txn("resolve")
-        return await self._build_resolved_meta(data_type=data_type, name=name)
+        if as_of is not None:
+            if as_of.tzinfo is None:
+                raise ValidationError("as_of must be a timezone-aware datetime")
+            if self._owner_col == "edge_uuid":
+                raise ValidationError(
+                    "as_of reads are supported for node scopes only; edge endpoint history is not tracked."
+                )
+        return await self._build_resolved_meta(data_type=data_type, name=name, as_of=as_of)
 
     async def read_from_meta(
         self,
@@ -1062,15 +1099,26 @@ class NodeScope(_BaseScope):
             old_path, parent_path = row
             new_path = f"{parent_path}/{new_name}" if parent_path else new_name
 
+            # One knowledge-time boundary shared by the live rewrite and the
+            # close/open of every re-pathed node's history interval.
+            now = await history_mod.transaction_now(conn)
             await conn.execute(
                 rf"""
                 UPDATE {P}node
                 SET path = %s || substring(path FROM length(%s) + 1),
                     name = CASE WHEN path = %s THEN %s ELSE name END,
-                    updated_at = now()
+                    updated_at = %s
                 WHERE path = %s OR path LIKE %s || '/%%' ESCAPE '\'
                 """,
-                (new_path, old_path, old_path, new_name, old_path, _like_escape(old_path)),
+                (new_path, old_path, old_path, new_name, now, old_path, _like_escape(old_path)),
+            )
+            await history_mod.replace_subtree_intervals(
+                conn,
+                old_path=old_path,
+                new_path=new_path,
+                renamed_node_uuid=node_uuid,
+                new_name=new_name,
+                valid_from=now,
             )
 
         return await self._apply_mutation(_do, dry_run=dry_run)
@@ -1103,6 +1151,16 @@ class NodeScope(_BaseScope):
         """
 
         async def _do(conn, node_uuid: UUID) -> None:
+            # Close the node's open history interval at the same boundary before
+            # deleting the live row, so the timeline records when it ceased to
+            # exist. node_history intentionally survives the delete (its FK is
+            # ON DELETE SET NULL), keeping the full as-of path trail.
+            now = await history_mod.transaction_now(conn)
+            await history_mod.close_node_interval(conn, node_uuid=node_uuid, valid_to=now)
+            await conn.execute(
+                f"UPDATE {P}node SET updated_at = %s WHERE uuid = %s",
+                (now, node_uuid),
+            )
             await conn.execute(f"DELETE FROM {P}node WHERE uuid = %s", (node_uuid,))
 
         return await self._apply_mutation(_do, dry_run=dry_run, fetch_after=False)
@@ -1183,15 +1241,24 @@ class NodeScope(_BaseScope):
             old_path, new_parent_path, own_name = row
             new_path = f"{new_parent_path}/{own_name}" if new_parent_path else own_name
 
+            # One knowledge-time boundary shared by the live re-parent rewrite
+            # and the close/open of every re-pathed node's history interval.
+            now = await history_mod.transaction_now(conn)
             await conn.execute(
                 rf"""
                 UPDATE {P}node
                 SET parent_uuid = CASE WHEN uuid = %s THEN %s ELSE parent_uuid END,
                     path = %s || substring(path FROM length(%s) + 1),
-                    updated_at = now()
+                    updated_at = %s
                 WHERE path = %s OR path LIKE %s || '/%%' ESCAPE '\'
                 """,
-                (node_uuid, new_parent_uuid, new_path, old_path, old_path, _like_escape(old_path)),
+                (node_uuid, new_parent_uuid, new_path, old_path, now, old_path, _like_escape(old_path)),
+            )
+            await history_mod.replace_subtree_intervals(
+                conn,
+                old_path=old_path,
+                new_path=new_path,
+                valid_from=now,
             )
 
         return await self._apply_mutation(_do, dry_run=dry_run)
@@ -1251,6 +1318,7 @@ class NodeScope(_BaseScope):
         *,
         data_type: str | None,
         name: str | None,
+        as_of: datetime | None = None,
     ) -> pl.DataFrame | None:
         """Resolve the scope's subtree to per-series read meta in one PG round-trip.
 
@@ -1259,11 +1327,18 @@ class NodeScope(_BaseScope):
         directly, with no second hash-and-join pass through
         :func:`resolve_manifest`. ``None`` when the subtree is empty or no
         series match the optional ``data_type`` / ``name`` filters.
+
+        With ``as_of`` set, the walk reads node-history intervals covering that
+        knowledge time via :func:`history.resolve_subtree_series_as_of`, so the
+        subtree and every path label reflect where nodes lived then rather than
+        today; the stable node uuid (and thus its series/values) is unchanged.
         """
         data_type_str = str(data_type).lower() if data_type else None
         if self._where_filters:
             where_conds, where_params = build_filter_conditions(
-                self._where_filters, type_col="node_type", table_alias="n"
+                self._where_filters,
+                type_col="node_type",
+                table_alias=("h" if as_of is not None else "n"),
             )
         else:
             where_conds, where_params = [], []
@@ -1273,7 +1348,31 @@ class NodeScope(_BaseScope):
         # round-trip. Reads are guarded against txn-bound scopes upstream.
         async with self._use_read_conn() as conn:
             with profiling._phase(profiling.PHASE_EDB_RESOLVE):
-                if self._path and self._node_uuid is None:
+                if as_of is not None:
+                    if self._path and self._node_uuid is None:
+                        meta = await history_mod.resolve_subtree_series_as_of(
+                            conn,
+                            as_of=as_of,
+                            root_path="/".join(self._path),
+                            where_conds=where_conds,
+                            where_params=where_params,
+                            data_type=data_type_str,
+                            name=name,
+                        )
+                    elif self._node_uuid is not None:
+                        meta = await history_mod.resolve_subtree_series_as_of(
+                            conn,
+                            as_of=as_of,
+                            start_uuid=self._node_uuid,
+                            rel_path="/".join(self._path) if self._path else None,
+                            where_conds=where_conds,
+                            where_params=where_params,
+                            data_type=data_type_str,
+                            name=name,
+                        )
+                    else:
+                        raise ValidationError("NodeScope has no path or uuid to resolve.")
+                elif self._path and self._node_uuid is None:
                     meta = await series_mod.resolve_subtree_series_for_read(
                         conn,
                         root_path="/".join(self._path),
@@ -1611,12 +1710,17 @@ class EdgeScope(_BaseScope):
         *,
         data_type: str | None,
         name: str | None,
+        as_of: datetime | None = None,
     ) -> pl.DataFrame | None:
         """Resolve this edge to per-series read meta in ONE PG round-trip.
 
         Both addressings go through :func:`series.resolve_edge_series_for_read`
         directly; the triple form collapses the paths → edge → series chain
         (3 round-trips) into a single query. ``None`` if no series match.
+
+        ``as_of`` is accepted only to match the base signature; the read entry
+        point rejects as-of on an edge scope before this runs, since edge
+        endpoint history is not tracked.
         """
         data_type_str = str(data_type).lower() if data_type else None
         # Client read checkout (namespace GUC) — see NodeScope._build_resolved_meta.

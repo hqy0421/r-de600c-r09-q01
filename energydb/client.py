@@ -82,6 +82,23 @@ from energydb.serialization import reconstruct_edge, reconstruct_node
 logger = logging.getLogger(__name__)
 
 
+def _check_as_of_read_kwargs(*, as_of: datetime | None, end_known: datetime | None) -> None:
+    """Validate the bitemporal ``as_of`` argument before any I/O.
+
+    Two guards: ``as_of`` must be timezone-aware so its comparison against
+    timestamptz history intervals is unambiguous, and it must not be combined
+    with an explicit ``end_known`` — ``as_of`` itself sets the exclusive upper
+    bound on the knowledge-time axis, so supplying both would leave two
+    conflicting answers to "which forecast version".
+    """
+    if as_of is None:
+        return
+    if as_of.tzinfo is None:
+        raise ValidationError("as_of must be a timezone-aware datetime")
+    if end_known is not None:
+        raise ValidationError("as_of sets the knowledge-time upper bound; do not also pass end_known.")
+
+
 class AsyncClient:
     """Async-native client for energy assets, hierarchy, and time series.
 
@@ -1039,6 +1056,7 @@ class AsyncClient:
         output: Output = "frame",
         backend: Backend = "polars",
         on_missing: OnMissing = "raise",
+        as_of: datetime | None = None,
     ) -> (
         pl.DataFrame
         | pd.DataFrame
@@ -1098,7 +1116,28 @@ class AsyncClient:
         unregistered series are affected: a structurally invalid manifest
         (missing or ambiguous routing column, wrong dtype, null routing value)
         raises either way.
+
+        **``as_of`` — bitemporal as-of read.** Pass a timezone-aware knowledge
+        time to interpret the whole read against the world known then:
+
+        * the manifest's ``path`` / ``node_uuid`` routing resolves against the
+          asset hierarchy as it was at ``as_of`` (via the node history), so a
+          point later moved from group A to group B still reads under A when the
+          read is as-of before the move, while an ordinary read shows B;
+        * the value window's exclusive upper bound on knowledge time
+          (``end_known``) is set to ``as_of``, so the forecast version selected
+          is the latest one known at or before that instant.
+
+        Both temporal axes are thus bounded by the same knowledge time in one
+        call. ``as_of`` cannot be combined with an explicit ``end_known`` (the
+        two would conflict over the version bound) and is not available on
+        :meth:`read_relative` (relative reads have no absolute knowledge axis).
+        Edge-routed manifests are not supported as-of: edge endpoint history is
+        not tracked, so an as-of edge read would silently use today's topology.
+        The node's stable uuid and its numeric records stay addressable across
+        the move; only the resolved path label and version change.
         """
+        _check_as_of_read_kwargs(as_of=as_of, end_known=end_known)
         with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
             manifest = to_polars(df)
         result, _n_series, missing = await execute_read(
@@ -1116,6 +1155,7 @@ class AsyncClient:
             include_knowledge_time=include_knowledge_time,
             on_missing=on_missing,
             output=output,
+            as_of=as_of,
         )
         with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
             return self._with_missing(result, missing, backend=backend, on_missing=on_missing)
@@ -1145,7 +1185,15 @@ class AsyncClient:
         :class:`ReadResult` when set to ``"skip"``, exactly as it does there.
         ``**td_kwargs`` are forwarded to :meth:`timedb.TimeDBClient.read_relative`;
         see that signature for accepted arguments (window selectors, etc.).
+
+        As-of reads are not available here: a relative read has no absolute
+        knowledge-time axis to pin ``as_of`` against. Use :meth:`read` with
+        ``as_of=`` for a bitemporal point-in-time read.
         """
+        if "as_of" in td_kwargs:
+            raise ValidationError(
+                "as_of is not supported on read_relative (no absolute knowledge-time axis); use read(as_of=...)."
+            )
         with profiling._phase(profiling.PHASE_EDB_OUTPUT_CONVERT):
             manifest = to_polars(df)
         result, _n_series, missing = await execute_read(
